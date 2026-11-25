@@ -1,0 +1,121 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
+import { io } from 'socket.io-client';
+import { RateBucket, Turn, User } from '../src/models.js';
+import { testStack } from './helpers.js';
+
+test('secure HTTP and WebSocket journeys backed by MongoDB', { timeout: 120000 }, async (t) => {
+  let attempts = 0;
+  let release;
+  let context;
+  const app = await testStack({ production: true, origin: 'https://fieldnote.example', async generate(messages, onDelta) {
+    attempts++;
+    context = messages;
+    const input = messages.at(-1).content;
+    onDelta('First');
+    if (input === 'Wait for release') await new Promise((resolve) => { release = resolve; });
+    if (input === 'Temporary failure' && attempts === 4) throw new Error('Test failure');
+    return `First answer: ${input}`;
+  } });
+  t.after(() => app.close());
+  async function request(path, { method = 'GET', body, cookie, origin = app.origin } = {}) {
+    const headers = { Origin: origin, ...(cookie ? { Cookie: cookie } : {}), ...(body ? { 'Content-Type': 'application/json' } : {}) };
+    const response = await fetch(`${app.url}/api${path}`, { method, headers, body: body && JSON.stringify(body) });
+    return { status: response.status, cookie: response.headers.get('set-cookie'), data: response.status === 204 ? null : await response.json() };
+  }
+  const account = { name: 'Test User', email: 'test@example.com', password: 'long-random-password-for-testing' };
+  const post = 'POST';
+  const patch = 'PATCH';
+  const send = (conversationId, text, requestId = randomUUID()) => ({ conversationId, requestId, text });
+  const first = await request('/auth/signup', { method: post, body: account });
+  assert.equal(first.status, 201);
+  assert.match(first.cookie, /__Host-fieldnote=.+;.*HttpOnly; Secure; SameSite=Lax/);
+  assert.equal(first.data.user.password, undefined);
+  const cookie = first.cookie.split(';')[0];
+  const second = await request('/auth/signup', { method: post, body: { ...account, email: 'second@example.com' } });
+  const other = second.cookie.split(';')[0];
+  assert.equal((await request('/auth/signup', { method: post, body: account })).status, 409);
+  assert.equal((await request('/auth/login', { method: post, body: { email: account.email, password: 'wrong' } })).status, 401);
+  assert.equal((await request('/me')).status, 401);
+  assert.equal((await request('/me', { cookie })).status, 200);
+  assert.equal((await request('/me/settings', { method: patch, cookie, origin: 'https://unrelated.example', body: { assistantName: 'Juniper', theme: 'dark' } })).status, 403);
+  const settings = await request('/me/settings', { method: patch, cookie, body: { assistantName: 'Juniper', theme: 'dark' } });
+  assert.equal(settings.data.user.settings.theme, 'dark');
+  assert.equal((await request('/conversations', { method: post, cookie, body: { category: 'random' } })).status, 400);
+  const { data: chat } = await request('/conversations', { method: post, cookie, body: { category: 'creative' } });
+  const { data: nextChat } = await request('/conversations', { method: post, cookie, body: { category: 'creative' } });
+  assert.equal((await request(`/conversations/${chat.id}`, { cookie: other })).status, 404);
+  assert.equal((await request('/conversations', { cookie: other })).data.items.length, 0);
+
+  const { data: { token } } = await request('/socket-token', { cookie });
+  const rejected = io(app.url, { transports: ['websocket'], auth: { token }, extraHeaders: { Origin: 'https://unrelated.example' }, reconnection: false });
+  assert.ok((await once(rejected, 'connect_error')).length);
+  rejected.close();
+  const socket = io(app.url, { transports: ['websocket'], auth: { token }, extraHeaders: { Origin: app.origin }, reconnection: false });
+  t.after(() => socket.close());
+  await once(socket, 'connect');
+  const deltas = [];
+  socket.on('turn:delta', (delta) => deltas.push(delta));
+  const payload = send(chat.id, 'Start a draft');
+  const { turn } = await socket.timeout(5000).emitWithAck('chat:send', payload);
+  assert.equal(turn.answer, 'First answer: Start a draft');
+  assert.equal(deltas[0].answer, 'First');
+  assert.match(context[0].content, /Juniper.*imaginative/);
+  assert.equal((await request('/messages', { method: post, cookie, body: payload })).data.id, turn.id, 'same request must remain idempotent');
+  assert.equal((await request('/messages', { method: post, cookie, body: { ...payload, text: 'Different' } })).status, 409);
+  assert.equal((await request('/messages', { method: post, cookie: other, body: payload })).status, 404);
+
+  const repeated = await request('/messages', { method: post, cookie, body: send(nextChat.id, payload.text) });
+  assert.equal(repeated.data.answer, turn.answer);
+  assert.equal(attempts, 1, 'identical full context should be served from the per-user cache');
+  const followup = await request('/messages', { method: post, cookie, body: send(chat.id, 'Give one detail') });
+  assert.equal(followup.status, 200);
+  assert.deepEqual(context.slice(1).map((item) => item.content), ['Start a draft', turn.answer, 'Give one detail']);
+  assert.equal((await request(`/messages/${turn.id}/feedback`, { method: patch, cookie: other, body: { rating: 1 } })).status, 404);
+  assert.equal((await request(`/messages/${turn.id}/feedback`, { method: patch, cookie, body: { rating: 1, feedback: 'Useful answer' } })).data.rating, 1);
+
+  const waiting = send(chat.id, 'Wait for release');
+  const pending = socket.timeout(7000).emitWithAck('chat:send', waiting);
+  await new Promise((resolve) => socket.once('turn:delta', resolve));
+  assert.equal((await request('/messages', { method: post, cookie, body: waiting })).status, 202);
+  assert.equal((await request('/messages', { method: post, cookie, body: send(chat.id, 'Overlapping') })).status, 409);
+  release();
+  assert.equal((await pending).turn.status, 'complete');
+
+  const failure = send(chat.id, 'Temporary failure');
+  assert.equal((await request('/messages', { method: post, cookie, body: failure })).status, 502);
+  assert.equal((await request('/messages', { method: post, cookie, body: failure })).status, 200);
+  const stale = send(chat.id, 'Interrupted');
+  await Turn.create({ owner: first.data.user.id, conversation: chat.id, requestId: stale.requestId, input: stale.text, status: 'pending', leasedUntil: new Date(0) });
+  const page = await request(`/conversations/${chat.id}?limit=1`, { cookie });
+  assert.equal(page.data.items[0].status, 'failed');
+  assert.ok(page.data.nextCursor);
+  assert.equal((await request(`/conversations/${chat.id}?limit=1&before=${page.data.nextCursor}`, { cookie })).data.items[0].input, failure.text);
+  const recent = (await request('/conversations?limit=1', { cookie })).data;
+  assert.ok(recent.nextCursor);
+  assert.equal((await request(`/conversations?before=${encodeURIComponent(recent.nextCursor)}`, { cookie })).data.items.length, 1);
+  assert.equal((await request('/api-nonexistent', { cookie })).status, 404);
+
+  assert.equal((await request('/admin/analytics', { cookie: other })).status, 403);
+  await User.updateOne({ _id: first.data.user.id }, { role: 'admin' });
+  const analytics = (await request('/admin/analytics', { cookie })).data;
+  assert.equal(analytics.activeUsers, 1);
+  assert.equal(analytics.totals.positive, 1);
+  assert.equal(analytics.totals.cached, 1);
+  assert.equal(analytics.feedback[0].feedback, 'Useful answer');
+
+  const minute = Math.floor(Date.now() / 60000);
+  await RateBucket.updateOne({ _id: `${first.data.user.id}:${minute}` }, { count: 20 }, { upsert: true });
+  assert.equal((await request('/messages', { method: post, cookie, body: send(chat.id, 'Over quota') })).status, 429);
+  const disconnected = once(socket, 'disconnect');
+  assert.equal((await request('/auth/logout', { method: post, cookie })).status, 204);
+  await disconnected;
+  assert.equal((await request('/me', { cookie })).status, 401);
+  const login = await request('/auth/login', { method: post, body: { email: account.email, password: account.password } });
+  assert.equal(login.status, 200);
+  assert.equal(login.data.user.settings.assistantName, 'Juniper');
+  const history = await request(`/conversations/${chat.id}`, { cookie: login.cookie.split(';')[0] });
+  assert.equal(history.data.items.find((item) => item.id === turn.id).feedback, 'Useful answer');
+});

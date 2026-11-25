@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: fieldnote-chat-api
+    runtime: node
+    plan: free
+    buildCommand: npm ci --workspace backend --include-workspace-root=false --omit=dev
+    startCommand: npm start --workspace backend
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: '24.22.1'
+      - key: NODE_ENV
+        value: production
+      - key: TRUST_PROXY
+        value: '1'
+      - key: JWT_SECRET
+        generateValue: true
+      - key: MONGODB_URI
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: APP_ORIGINS
+        sync: false
+      - key: AI_MODEL
+        value: gpt-4.1-mini

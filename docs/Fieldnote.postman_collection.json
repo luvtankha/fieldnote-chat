@@ -1,0 +1,327 @@
+{
+  "info": {
+    "name": "Fieldnote API smoke test",
+    "description": "Runs against the documented isolated test server. Creates one test account and tests the REST chat flow.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "pm.request.headers.upsert({ key: 'Origin', value: pm.variables.get('origin') });"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:4400/api"
+    },
+    {
+      "key": "origin",
+      "value": "http://127.0.0.1:3400"
+    },
+    {
+      "key": "password",
+      "value": "isolated-postman-account-123"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/health"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+              "pm.test('MongoDB is ready', () => pm.expect(pm.response.json().status).to.eql('ok'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Sign up",
+      "request": {
+        "method": "POST",
+        "url": "{{baseUrl}}/auth/signup",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"name\": \"Postman Tester\",\n  \"email\": \"{{email}}\",\n  \"password\": \"{{password}}\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.collectionVariables.set('email', `postman-${pm.variables.replaceIn('{{$guid}}')}@example.com`);",
+              "pm.collectionVariables.set('requestId', pm.variables.replaceIn('{{$guid}}'));"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 201', () => pm.response.to.have.status(201));",
+              "pm.test('Session cookie issued', () => pm.expect(pm.response.headers.get('Set-Cookie')).to.include('HttpOnly'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Profile",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/me"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+              "pm.test('Signed-in profile', () => pm.expect(pm.response.json().user.email).to.eql(pm.collectionVariables.get('email')));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create creative conversation",
+      "request": {
+        "method": "POST",
+        "url": "{{baseUrl}}/conversations",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"category\": \"creative\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 201', () => pm.response.to.have.status(201));",
+              "pm.collectionVariables.set('chatId', pm.response.json().id);",
+              "pm.test('Category is saved', () => pm.expect(pm.response.json().category).to.eql('creative'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Generate reply",
+      "request": {
+        "method": "POST",
+        "url": "{{baseUrl}}/messages",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"conversationId\": \"{{chatId}}\",\n  \"requestId\": \"{{requestId}}\",\n  \"text\": \"Write a one-line greeting for a community garden.\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+              "pm.collectionVariables.set('turnId', pm.response.json().id);",
+              "pm.test('Assistant replied', () => pm.expect(pm.response.json().answer).to.be.a('string').with.length.greaterThan(0));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Rate reply",
+      "request": {
+        "method": "PATCH",
+        "url": "{{baseUrl}}/messages/{{turnId}}/feedback",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"rating\": 1,\n  \"feedback\": \"Good API smoke test.\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+              "pm.test('Rating was returned', () => pm.expect(pm.response.json().rating).to.eql(1));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Read history",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/conversations/{{chatId}}"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+              "pm.test('Reply and rating are persisted', () => pm.expect(pm.response.json().items[0].rating).to.eql(1));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Log out",
+      "request": {
+        "method": "POST",
+        "url": "{{baseUrl}}/auth/logout"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 204', () => pm.response.to.have.status(204));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Require authentication",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/conversations"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 401', () => pm.response.to.have.status(401));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Log in",
+      "request": {
+        "method": "POST",
+        "url": "{{baseUrl}}/auth/login",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"email\": \"{{email}}\",\n  \"password\": \"{{password}}\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Read history after signing in",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/conversations/{{chatId}}"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+              "pm.test('Same reply is visible', () => pm.expect(pm.response.json().items[0].id).to.eql(pm.collectionVariables.get('turnId')));"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
